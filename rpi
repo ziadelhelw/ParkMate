@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+from picamera2 import Picamera2
+from ultralytics import YOLO
+import cv2
+import serial
+import sys
+
+# === GPIO Ultrasonic Sensor Pins ===
+GPIO_TRIGGER_FRONT = 23
+GPIO_ECHO_FRONT = 24
+GPIO_TRIGGER_BACK = 17
+GPIO_ECHO_BACK = 27
+
+# Setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(GPIO_TRIGGER_FRONT, GPIO.OUT)
+GPIO.setup(GPIO_ECHO_FRONT, GPIO.IN)
+GPIO.setup(GPIO_TRIGGER_BACK, GPIO.OUT)
+GPIO.setup(GPIO_ECHO_BACK, GPIO.IN)
+
+# Serial setup
+try:
+    ser = serial.Serial('/dev/serial0', 9600, timeout=1)
+except serial.SerialException as e:
+    print(f"Serial error: {e}")
+    sys.exit(1)
+
+# YOLO Model
+model = YOLO('best.pt')
+
+# Camera
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# Variables
+obstacle_detected = False
+last_event_time = 0
+cooldown = 1
+
+def get_distance(trigger, echo):
+    GPIO.output(trigger, True)
+    time.sleep(0.00001)
+    GPIO.output(trigger, False)
+
+    start = time.time()
+    timeout = start + 0.05
+
+    while GPIO.input(echo) == 0 and time.time() < timeout:
+        start = time.time()
+    if time.time() >= timeout:
+        return 999
+
+    while GPIO.input(echo) == 1 and time.time() < timeout:
+        stop = time.time()
+    if time.time() >= timeout:
+        return 999
+
+    elapsed = stop - start
+    distance = (elapsed * 34300) / 2
+    return distance
+
+def send_clear():
+    ser.write("clear\n".encode())
+    print("Sent: clear")
+
+def send_block():
+    ser.write("not clear\n".encode())
+    print("Sent: not clear")
+
+def send_move_forward(cm):
+    ser.write(f"move_forward_{cm}\n".encode())
+    print(f"Sent: move_forward_{cm} cm")
+
+def send_move_backward(cm):
+    ser.write(f"move_backward_{cm}\n".encode())
+    print(f"Sent: move_backward_{cm} cm")
+
+def send_centered():
+    ser.write("centered\n".encode())
+    print("Sent: centered")
+
+# ? New centering range (9–12 cm)
+def is_car_centered(front, back):
+    return (9 <= front <= 12) and (9 <= back <= 12)
+
+try:
+    frame_counter = 0
+
+    while True:
+        dist_front = get_distance(GPIO_TRIGGER_FRONT, GPIO_ECHO_FRONT)
+        dist_back = get_distance(GPIO_TRIGGER_BACK, GPIO_ECHO_BACK)
+
+        print(f"[{time.strftime('%H:%M:%S')}] Front: {dist_front:.2f} cm | Back: {dist_back:.2f} cm")
+
+        frame_counter += 1
+        if frame_counter % 3 == 0:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+            results = model.predict(frame)[0]
+
+            boxes = results.boxes
+            classes = boxes.cls.cpu().numpy().astype(int)
+            confs = boxes.conf.cpu().numpy()
+
+            label_0 = any(cls == 0 and conf >= 0.3 for cls, conf in zip(classes, confs))
+            label_1 = any(cls == 1 and conf >= 0.8 for cls, conf in zip(classes, confs))
+
+            now = time.time()
+
+            if label_0:
+                print("Detected: CLEAR slot")
+                send_clear()
+
+                while not is_car_centered(dist_front, dist_back):
+                    dist_front = get_distance(GPIO_TRIGGER_FRONT, GPIO_ECHO_FRONT)
+                    dist_back = get_distance(GPIO_TRIGGER_BACK, GPIO_ECHO_BACK)
+                    print(f"[Centering] Front: {dist_front:.2f} cm | Back: {dist_back:.2f} cm")
+
+                    if dist_front < 8.8 and dist_back >= 12.2:
+                        send_move_backward(2)
+                    elif dist_front > 12.2 and dist_back <= 8.8:
+                        send_move_forward(2)
+                    elif dist_front > 12.2 and 8.8 < dist_back <= 12.2:
+                        send_move_forward(1)
+                    elif dist_front < 8.8 and 8.8 < dist_back <= 12.2:
+                        send_move_backward(1)
+                    else:
+                        print("Minor misalignment...")
+
+                    time.sleep(2)
+
+                print("Car is centered. Sending 'centered'...")
+                send_centered()
+                obstacle_detected = False
+                last_event_time = now
+
+            elif label_1:
+                if not obstacle_detected and now - last_event_time > cooldown:
+                    send_block()
+                    obstacle_detected = True
+                    last_event_time = now
+
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    print("Exiting...")
+
+finally:
+    picam2.close()
+    GPIO.cleanup()
