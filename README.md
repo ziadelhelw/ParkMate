@@ -1,3 +1,4 @@
+![IMG-20250625-WA0026](https://github.com/user-attachments/assets/78f6c05a-cd18-4aa9-af28-e22b9231c0d9)
 🚗 ParkMate: Intelligent Autonomous Parking System
 ParkMate is a graduation project that demonstrates a fully autonomous self-parking car using computer vision, embedded systems, and wireless control. The system detects empty parking spots and navigates the vehicle safely into them without human intervention.
 
